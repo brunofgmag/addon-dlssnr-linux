@@ -13,7 +13,7 @@ if [[ "${1:-}" == "--test" ]]; then
   TEST_BUILD=1
   shift
 fi
-RENODX="$HOME/projects/renodx"
+RENODX="${RENODX:-$HOME/projects/renodx}"
 RESHADE_INC="$RENODX/external/reshade/include"
 IMGUI_INC="$RENODX/external/reshade/deps/imgui"
 NGX_INC="$RENODX/external/DLSS/include"
