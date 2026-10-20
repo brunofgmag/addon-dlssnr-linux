@@ -233,7 +233,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12CreateFeature(
     Log("ngx-probe: Reserved18 (DLSS-NR) handle captured — evals will be dumped");
   }
   if (feature_id == NVSDK_NGX_Feature_SuperSampling && result == NVSDK_NGX_Result_Success &&
-      params != nullptr) {
+      params != nullptr && out_handle != nullptr) {
     unsigned w = 0, h = 0, ow = 0, oh = 0;
     int flags = 0;
     params->Get(NVSDK_NGX_Parameter_Width, &w);
@@ -241,7 +241,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12CreateFeature(
     params->Get(NVSDK_NGX_Parameter_OutWidth, &ow);
     params->Get(NVSDK_NGX_Parameter_OutHeight, &oh);
     params->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags);
-    nr_runner::OnDlssCreate(w, h, ow, oh, flags);
+    nr_runner::OnDlssCreate(*out_handle, w, h, ow, oh, flags);
   }
   return result;
 }
@@ -272,13 +272,14 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12EvaluateFeature(
   }
   const auto eval_result = real_D3D12_EvaluateFeature(cmd_list, handle, params, callback);
   if (eval_result == NVSDK_NGX_Result_Success)
-    nr_runner::OnDlssEvaluated(cmd_list, params);
+    nr_runner::OnDlssEvaluated(cmd_list, handle, params);
   return eval_result;
 }
 
 static decltype(&NVSDK_NGX_D3D12_ReleaseFeature) real_D3D12_ReleaseFeature = nullptr;
 inline NVSDK_NGX_Result NVSDK_CONV HookD3D12ReleaseFeature(NVSDK_NGX_Handle* handle) {
   Logf("ngx-probe: D3D12_ReleaseFeature handle=%p", static_cast<void*>(handle));
+  nr_runner::OnDlssRelease(handle);
   return real_D3D12_ReleaseFeature(handle);
 }
 

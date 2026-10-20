@@ -108,6 +108,16 @@ struct Grave {
   int frames = 0;
 };
 
+constexpr uint64_t kStaleEvaluates = 240;
+
+struct DlssFeature {
+  const void* handle = nullptr;
+  unsigned render_w = 0, render_h = 0;
+  unsigned out_w = 0, out_h = 0;
+  int flags = 0;
+  uint64_t last_eval = 0;
+};
+
 struct State {
   bool gave_up = false;
   bool enabled = true;
@@ -152,6 +162,10 @@ struct State {
   int style = 0;
   float model_scale = 1.0f;
   unsigned work_w = 0, work_h = 0;
+
+  std::vector<DlssFeature> dlss;
+  uint64_t dlss_evals = 0;
+  const void* followed = nullptr;
 
   // Geometry of the game's current DLSS-SR feature.
   unsigned render_w = 0, render_h = 0;
@@ -337,14 +351,45 @@ inline unsigned WorkSize(unsigned full, float scale) {
 
 // Remember the game's DLSS-SR geometry; the NR feature is built against the display resolution and
 // its guides against the render resolution.
-inline void OnDlssCreate(unsigned w, unsigned h, unsigned ow, unsigned oh, int flags) {
-  s.render_w = w;
-  s.render_h = h;
-  s.out_w = ow;
-  s.out_h = oh;
-  s.create_flags = flags;
-  if (s.feature != nullptr && (s.feature_w != ow || s.feature_h != oh))
-    RetireFeature("geometry changed");
+inline void OnDlssCreate(const void* handle, unsigned w, unsigned h, unsigned ow, unsigned oh,
+                         int flags) {
+  DlssFeature* entry = nullptr;
+  for (auto& f : s.dlss)
+    if (f.handle == handle) entry = &f;
+  if (entry == nullptr) entry = &s.dlss.emplace_back();
+  *entry = {handle, w, h, ow, oh, flags, 0};
+}
+
+inline void OnDlssRelease(const void* handle) {
+  std::erase_if(s.dlss, [handle](const DlssFeature& f) { return f.handle == handle; });
+  if (s.followed == handle) s.followed = nullptr;
+}
+
+inline const DlssFeature* Follow(const void* handle) {
+  ++s.dlss_evals;
+  DlssFeature* current = nullptr;
+  for (auto& f : s.dlss) {
+    if (f.handle != handle) continue;
+    f.last_eval = s.dlss_evals;
+    current = &f;
+  }
+  if (current == nullptr) return nullptr;
+
+  const DlssFeature* largest = nullptr;
+  for (const auto& f : s.dlss) {
+    if (f.last_eval == 0 || s.dlss_evals - f.last_eval > kStaleEvaluates) continue;
+    if (largest == nullptr ||
+        (uint64_t)f.out_w * f.out_h > (uint64_t)largest->out_w * largest->out_h)
+      largest = &f;
+  }
+  if (largest != current) return nullptr;
+
+  if (s.followed != handle) {
+    s.followed = handle;
+    ngx_probe::Logf("nr-fwd: following DLSS-SR feature %p, %ux%u to %ux%u", handle,
+                    current->render_w, current->render_h, current->out_w, current->out_h);
+  }
+  return current;
 }
 
 // Process teardown: pointers in the shared block must not outlive us.
@@ -665,9 +710,19 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
 }
 
 // Called after every successful game DLSS-SR evaluate, on the game's own command list.
-inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
+inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const void* handle,
+                            const NVSDK_NGX_Parameter* game_params) {
   if (s.gave_up || cmd == nullptr || game_params == nullptr) return;
-  if (s.out_w == 0 || s.out_h == 0) return;  // no DLSS-SR create seen yet
+  const DlssFeature* dlss = Follow(handle);
+  if (dlss == nullptr) return;
+  if (s.feature != nullptr && (s.feature_w != dlss->out_w || s.feature_h != dlss->out_h))
+    RetireFeature("geometry changed");
+  s.render_w = dlss->render_w;
+  s.render_h = dlss->render_h;
+  s.out_w = dlss->out_w;
+  s.out_h = dlss->out_h;
+  s.create_flags = dlss->flags;
+  if (s.out_w == 0 || s.out_h == 0) return;
 
   TickGraveyard();
   if (s.retire_pending.exchange(false, std::memory_order_relaxed))
