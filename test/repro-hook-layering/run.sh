@@ -9,8 +9,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 ADDON="${1:-$REPO/build/dlssnr-linux.addon64}"
 
-RENODX="$HOME/projects/renodx"
+RENODX="${RENODX:-$HOME/projects/renodx}"
 NGX_INC="$RENODX/external/DLSS/include"
+RESHADE_INC="$RENODX/external/reshade/include"
+DETOURS_SRC="$RENODX/external/Detours/src"
+DETOURS_OBJ="$REPO/build/detours-obj"
 XWIN="$HOME/.xwin"
 
 CLANGXX="clang++"
@@ -35,8 +38,11 @@ LDFLAGS=(
 
 "$CLANGXX" -shared -std=c++20 "${CFLAGS[@]}" "${LDFLAGS[@]}" \
   -o "$HERE/_nvngx.dll" "$HERE/stub_nvngx.cpp"
-"$CLANGXX" -std=c++20 "${CFLAGS[@]}" "${LDFLAGS[@]}" -I "$NGX_INC" \
+"$CLANGXX" -std=c++20 "${CFLAGS[@]}" "${LDFLAGS[@]}" -I "$NGX_INC" -I "$RESHADE_INC" \
   -o "$HERE/repro.exe" "$HERE/harness.cpp"
+"$CLANGXX" -shared -std=c++20 "${CFLAGS[@]}" "${LDFLAGS[@]}" -I "$DETOURS_SRC" \
+  -o "$HERE/glass_stub.dll" "$HERE/glass_stub.cpp" \
+  "$DETOURS_OBJ"/detours.obj "$DETOURS_OBJ"/modules.obj "$DETOURS_OBJ"/disasm.obj
 cp "$ADDON" "$HERE/dlssnr-linux.addon64"
 
 cd "$HERE"
@@ -45,14 +51,17 @@ set +e
 WINEDEBUG=-all wine ./repro.exe ${REPRO_ARGS:-}
 rc=$?
 set -e
+rm -f "$HERE/glass-cockpit-dlss-fix.addon64"
 
 echo
 case "$rc" in
-  0)  echo "RESULT: CLEAN — no hook leak (fixed build)" ;;
+  0)  echo "RESULT: CLEAN" ;;
   42) echo "RESULT: REPRO — re-entrant hook loop (the GTA V Enhanced hang)" ;;
   43) echo "RESULT: REPRO — call faulted through a stale detour" ;;
   44) echo "RESULT: REPRO — detour leaked past addon unload" ;;
   45) echo "RESULT: FAIL — addon hooked despite the leak marker" ;;
+  46) echo "RESULT: FAIL — addon hooked DLSS before the Glass Cockpit DLSS Fix" ;;
+  47) echo "RESULT: FAIL — the Glass Cockpit DLSS Fix runs outside the addon" ;;
   *)  echo "RESULT: harness/setup failure (rc=$rc)" ;;
 esac
 exit "$rc"

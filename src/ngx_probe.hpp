@@ -18,6 +18,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iterator>
 
 #include <d3d11.h>
@@ -324,6 +325,45 @@ inline const HookEntry kHooks[] = {
     {"NVSDK_NGX_D3D11_EvaluateFeature", reinterpret_cast<void**>(&real_D3D11_EvaluateFeature), reinterpret_cast<void*>(&HookD3D11EvaluateFeature)},
 };
 
+inline constexpr char kGlassCockpitAddon[] = "glass-cockpit-dlss-fix.addon64";
+inline constexpr ULONGLONG kGlassCockpitWaitMs = 60000;
+
+enum class GlassCockpit { absent, hooked, waiting, gave_up };
+
+inline bool GlassCockpitBesideUs() {
+  HMODULE self = nullptr;
+  if (!GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(&GlassCockpitBesideUs), &self))
+    return false;
+  char path[MAX_PATH] = {};
+  const DWORD length = GetModuleFileNameA(self, path, MAX_PATH);
+  if (length == 0 || length >= MAX_PATH) return false;
+  char* name = std::strrchr(path, '\\');
+  if (name == nullptr) return false;
+  ++name;
+  const size_t room = static_cast<size_t>(path + MAX_PATH - name);
+  if (sizeof(kGlassCockpitAddon) > room) return false;
+  std::memcpy(name, kGlassCockpitAddon, sizeof(kGlassCockpitAddon));
+  return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+inline bool StartsWithJump(const void* code) {
+  const auto* bytes = static_cast<const unsigned char*>(code);
+  return bytes[0] == 0xE9 || (bytes[0] == 0xFF && bytes[1] == 0x25);
+}
+
+inline GlassCockpit GlassCockpitState(HMODULE ngx) {
+  static const bool beside_us = GlassCockpitBesideUs();
+  if (!beside_us) return GlassCockpit::absent;
+  static const ULONGLONG deadline = GetTickCount64() + kGlassCockpitWaitMs;
+  const FARPROC evaluate = GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature");
+  if (evaluate != nullptr && GetModuleHandleA(kGlassCockpitAddon) != nullptr &&
+      StartsWithJump(reinterpret_cast<const void*>(evaluate)))
+    return GlassCockpit::hooked;
+  return GetTickCount64() < deadline ? GlassCockpit::waiting : GlassCockpit::gave_up;
+}
+
 inline bool installed = false;
 inline bool blocked = false;  // a state TryInstall must never retry out of
 
@@ -372,6 +412,14 @@ inline bool TryInstall() {
     module = nullptr;
   }
   if (module == nullptr) return false;
+
+  const GlassCockpit glass_cockpit = GlassCockpitState(module);
+  if (glass_cockpit == GlassCockpit::waiting) {
+    static bool announced = false;
+    if (!announced) Log("ngx-probe: waiting for the Glass Cockpit DLSS Fix to hook DLSS first");
+    announced = true;
+    return false;
+  }
 
   LONG* marker = AttachedMarker();
   if (marker != nullptr && *marker != 0) {
@@ -425,7 +473,10 @@ inline bool TryInstall() {
 
   if (marker != nullptr) *marker = 1;
   installed = true;
-  Logf("ngx-probe: hooked %d NGX exports on %s", attached, module_name);
+  Logf("ngx-probe: hooked %d NGX exports on %s%s", attached, module_name,
+       glass_cockpit == GlassCockpit::hooked    ? ", over the Glass Cockpit DLSS Fix"
+       : glass_cockpit == GlassCockpit::gave_up ? ", without the Glass Cockpit DLSS Fix's hook"
+                                                : "");
   return true;
 }
 

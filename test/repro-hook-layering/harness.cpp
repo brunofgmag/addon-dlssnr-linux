@@ -24,13 +24,24 @@
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_defs.h>
+#include <reshade_events.hpp>
 
 // --- ReShade addon API stubs (found via K32EnumProcessModules) -------------
 
 static volatile LONG g_create_log_depth = 0;
 static bool g_watch = false;
+static bool g_order_watch = false;
+static void* g_events[256] = {};
+static const char* g_order[8] = {};
+static int g_marks = 0;
 
 extern "C" {
+
+__declspec(dllexport) void HarnessMark(const char* who) {
+  std::printf("[host] mark: %s\n", who);
+  std::fflush(stdout);
+  if (g_marks < 8) g_order[g_marks++] = who;
+}
 
 __declspec(dllexport) bool ReShadeRegisterAddon(void*, uint32_t api_version) {
   std::printf("[host] ReShadeRegisterAddon (api %u)\n", api_version);
@@ -42,6 +53,7 @@ __declspec(dllexport) void ReShadeUnregisterAddon(void*) {
 __declspec(dllexport) void ReShadeLogMessage(void*, int, const char* message) {
   std::printf("[addon] %s\n", message);
   std::fflush(stdout);
+  if (g_order_watch && std::strstr(message, "D3D12_EvaluateFeature #") != nullptr) HarnessMark("dlssnr");
   if (g_watch && std::strstr(message, "D3D12_CreateFeature(feature=") != nullptr) {
     if (InterlockedIncrement(&g_create_log_depth) >= 50) {
       std::printf("\nREPRO: re-entrant hook loop — CreateFeature re-entered 50 times in one call\n");
@@ -58,8 +70,12 @@ __declspec(dllexport) void* ReShadeGetImGuiFunctionTable(uint32_t version) {
   std::printf("[host] ReShadeGetImGuiFunctionTable (imgui %u)\n", version);
   return dummy_table;
 }
-__declspec(dllexport) void ReShadeRegisterEvent(uint32_t, void*) {}
-__declspec(dllexport) void ReShadeUnregisterEvent(uint32_t, void*) {}
+__declspec(dllexport) void ReShadeRegisterEvent(uint32_t event, void* callback) {
+  if (event < 256) g_events[event] = callback;
+}
+__declspec(dllexport) void ReShadeUnregisterEvent(uint32_t event, void*) {
+  if (event < 256) g_events[event] = nullptr;
+}
 __declspec(dllexport) void ReShadeRegisterOverlay(const char*, void*) {}
 __declspec(dllexport) void ReShadeUnregisterOverlay(const char*, void*) {}
 __declspec(dllexport) bool ReShadeGetConfigValue(void*, void*, const char*, const char*, char*,
@@ -160,8 +176,67 @@ static int PretendLeak() {
   return 0;
 }
 
+static int GlassCockpitOrder() {
+  if (!CopyFileA("glass_stub.dll", "glass-cockpit-dlss-fix.addon64", FALSE)) {
+    std::printf("[host] could not place the Glass Cockpit DLSS Fix stub (err %lu)\n", GetLastError());
+    return 2;
+  }
+  const HMODULE ngx = LoadLibraryA("_nvngx.dll");
+  const FARPROC evaluate =
+      (ngx != nullptr) ? GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature") : nullptr;
+  if (evaluate == nullptr) {
+    std::printf("[host] failed to load stub _nvngx.dll\n");
+    return 2;
+  }
+  if (LoadLibraryA("dlssnr-linux.addon64") == nullptr) {
+    std::printf("[host] failed to load dlssnr-linux.addon64 (err %lu)\n", GetLastError());
+    return 2;
+  }
+  DumpProlog("after the addon loaded", reinterpret_cast<void*>(evaluate));
+  if (*reinterpret_cast<unsigned char*>(evaluate) == 0xe9) {
+    std::printf("\nFAIL: the addon hooked DLSS before the Glass Cockpit DLSS Fix could\n");
+    return 46;
+  }
+
+  const HMODULE glass = LoadLibraryA("glass-cockpit-dlss-fix.addon64");
+  const auto hook = (glass != nullptr)
+                        ? reinterpret_cast<bool (*)()>(GetProcAddress(glass, "GlassStubHook"))
+                        : nullptr;
+  if (hook == nullptr || !hook()) {
+    std::printf("[host] the Glass Cockpit DLSS Fix stub did not hook\n");
+    return 2;
+  }
+  DumpProlog("after the fix hooked", reinterpret_cast<void*>(evaluate));
+
+  using Present = void (*)(void*, void*, const void*, const void*, uint32_t, const void*);
+  const auto present = reinterpret_cast<Present>(
+      g_events[static_cast<uint32_t>(reshade::addon_event::present)]);
+  if (present == nullptr) {
+    std::printf("[host] the addon registered no present callback\n");
+    return 2;
+  }
+  present(nullptr, nullptr, nullptr, nullptr, 0, nullptr);
+  DumpProlog("after a present", reinterpret_cast<void*>(evaluate));
+
+  using PfnEvaluate = NVSDK_NGX_Result(__cdecl*)(void*, void*, NVSDK_NGX_Parameter*, void*);
+  FakeParams params;
+  g_order_watch = true;
+  reinterpret_cast<PfnEvaluate>(evaluate)(nullptr, nullptr, &params, nullptr);
+  g_order_watch = false;
+
+  const bool addon_outside = g_marks == 2 && std::strcmp(g_order[0], "dlssnr") == 0 &&
+                             std::strcmp(g_order[1], "glass-cockpit") == 0;
+  if (!addon_outside) {
+    std::printf("\nFAIL: the Glass Cockpit DLSS Fix runs outside the addon, so it draws the screens after DLSS 5\n");
+    return 47;
+  }
+  std::printf("\nCLEAN: the addon runs outside the Glass Cockpit DLSS Fix, so DLSS 5 sees the redrawn screens\n");
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::strcmp(argv[1], "--pretend-leak") == 0) return PretendLeak();
+  if (argc > 1 && std::strcmp(argv[1], "--glass-cockpit-order") == 0) return GlassCockpitOrder();
   // Pin the stub NGX module for the whole process lifetime, like the driver's
   // _nvngx.dll in a real game.
   const HMODULE ngx = LoadLibraryA("_nvngx.dll");
