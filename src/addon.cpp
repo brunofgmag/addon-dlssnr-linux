@@ -106,6 +106,7 @@ void LoadSettings() {
   reshade::get_config_value(nullptr, kConfigSection, "GlobalIntensity", s.local_tone);
   reshade::get_config_value(nullptr, kConfigSection, "Preset", s.preset);
   reshade::get_config_value(nullptr, kConfigSection, "Style", s.style);
+  reshade::get_config_value(nullptr, kConfigSection, "ModelScale", s.model_scale);
 
   // A hand-edited ini must not push values past what the overlay allows.
   s.transfer = Clamp(s.transfer, 0.0f, 1.5f);
@@ -115,6 +116,7 @@ void LoadSettings() {
   s.intensity = Clamp(s.intensity, 0.0f, 2.0f);
   s.local_structure = Clamp(s.local_structure, 0.0f, 2.0f);
   s.local_tone = Clamp(s.local_tone, 0.0f, 2.0f);
+  s.model_scale = Clamp(s.model_scale, 0.25f, 1.0f);
   if (s.preset < 0 || s.preset > 7) s.preset = 0;
   if (s.style < 0 || s.style > 2) s.style = 0;
 }
@@ -130,6 +132,7 @@ void SaveSettings() {
   reshade::set_config_value(nullptr, kConfigSection, "GlobalIntensity", s.local_tone);
   reshade::set_config_value(nullptr, kConfigSection, "Preset", s.preset);
   reshade::set_config_value(nullptr, kConfigSection, "Style", s.style);
+  reshade::set_config_value(nullptr, kConfigSection, "ModelScale", s.model_scale);
 }
 
 // A slider with a reset-to-default button on its right.
@@ -176,6 +179,7 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
   changed |= SliderWithReset("NR intensity", &s.intensity, 0.0f, 2.0f, "%.2f", 1.0f);
   changed |= SliderWithReset("Structure intensity", &s.local_structure, 0.0f, 2.0f, "%.2f", 1.0f);
   changed |= SliderWithReset("Global intensity", &s.local_tone, 0.0f, 2.0f, "%.2f", 1.0f);
+  changed |= SliderWithReset("Model resolution", &s.model_scale, 0.25f, 1.0f, "%.2fx", 1.0f);
   changed |= ImGui::SliderInt("Preset", &s.preset, 0, 7);
   ImGui::SameLine();
   ImGui::PushID("preset-reset");

@@ -150,6 +150,8 @@ struct State {
   float local_tone = 1.0f;
   int preset = 0;
   int style = 0;
+  float model_scale = 1.0f;
+  unsigned work_w = 0, work_h = 0;
 
   // Geometry of the game's current DLSS-SR feature.
   unsigned render_w = 0, render_h = 0;
@@ -323,6 +325,14 @@ inline void RetireFeature(const char* why) {
   s.proxy = nullptr;
   s.output_format = DXGI_FORMAT_UNKNOWN;
   s.feature_w = s.feature_h = 0;
+  s.work_w = s.work_h = 0;
+}
+
+inline unsigned WorkSize(unsigned full, float scale) {
+  if (!(scale < 1.0f)) return full;
+  const float clamped = scale < 0.25f ? 0.25f : scale;
+  const unsigned size = (unsigned)((float)full * clamped + 0.5f);
+  return size == 0 ? 1 : size;
 }
 
 // Remember the game's DLSS-SR geometry; the NR feature is built against the display resolution and
@@ -439,8 +449,6 @@ inline bool CreateTextures(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = s.out_w;
-  desc.Height = s.out_h;
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = game_desc.Format;
@@ -453,14 +461,17 @@ inline bool CreateTextures(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_
   struct {
     ID3D12Resource** texture;
     DXGI_FORMAT format;
+    unsigned width, height;
   } textures[3] = {
-      {&s.output, DXGI_FORMAT_R16G16B16A16_FLOAT},
-      {&s.color_copy, game_desc.Format},
-      {&s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT},
+      {&s.output, DXGI_FORMAT_R16G16B16A16_FLOAT, s.work_w, s.work_h},
+      {&s.color_copy, game_desc.Format, s.out_w, s.out_h},
+      {&s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT, s.work_w, s.work_h},
   };
   bool ok = true;
   for (auto& t : textures) {
     desc.Format = t.format;
+    desc.Width = t.width;
+    desc.Height = t.height;
     if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                IID_PPV_ARGS(t.texture)))) {
@@ -476,8 +487,8 @@ inline bool CreateTextures(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_
     return GiveUp("texture creation failed");
   }
   s.output_format = game_desc.Format;
-  ngx_probe::Logf("nr-fwd: textures %ux%u format=%u (answer, original, proxy)", s.out_w, s.out_h,
-                  (unsigned)s.output_format);
+  ngx_probe::Logf("nr-fwd: textures %ux%u format=%u (original), %ux%u (answer, proxy)", s.out_w,
+                  s.out_h, (unsigned)s.output_format, s.work_w, s.work_h);
   return true;
 }
 
@@ -518,10 +529,15 @@ inline bool EnsureFeature(ID3D12GraphicsCommandList* cmd) {
     s.snippet_inited = true;
   }
 
+  s.work_w = WorkSize(s.out_w, s.model_scale);
+  s.work_h = WorkSize(s.out_h, s.model_scale);
+  ngx_probe::Logf("nr-fwd: model resolution %ux%u of %ux%u (scale %.2f)", s.work_w, s.work_h,
+                  s.out_w, s.out_h, s.model_scale);
+
   void* p = s.caps;
   SetUInt(p, "DLSSNR.Enabled", 1u);
-  SetUInt(p, "DLSSNR.Width", s.out_w);
-  SetUInt(p, "DLSSNR.Height", s.out_h);
+  SetUInt(p, "DLSSNR.Width", s.work_w);
+  SetUInt(p, "DLSSNR.Height", s.work_h);
   SetUInt(p, "CreationNodeMask", 1u);
   SetUInt(p, "VisibilityNodeMask", 1u);
   SetUInt(p, "DLSSNR.Hint.Render.Preset", (unsigned)s.preset);
@@ -575,8 +591,8 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   wp = (wp < 0.01f ? 0.01f : (wp > 1000.0f ? 1000.0f : wp)) * s.wp_scale;
 
   // Copy the original aside, encode the display-referred proxy, record the measurement.
-  if (!nr_compose::RecordPre(cmd, color, s.color_copy, s.proxy, s.out_w, s.out_h, s.eval_count,
-                             wp)) {
+  if (!nr_compose::RecordPre(cmd, color, s.color_copy, s.proxy, s.out_w, s.out_h, s.work_w,
+                             s.work_h, s.eval_count, wp)) {
     GiveUp("compose pipeline initialisation failed");
     return;
   }
@@ -596,19 +612,19 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   SetResource(p, "DLSSNR.Output", s.output);
 
   SetUInt(p, "DLSSNR.Enabled", 1u);
-  SetUInt(p, "DLSSNR.Width", s.out_w);
-  SetUInt(p, "DLSSNR.Height", s.out_h);
+  SetUInt(p, "DLSSNR.Width", s.work_w);
+  SetUInt(p, "DLSSNR.Height", s.work_h);
   SetUInt(p, "DLSSNR.DepthInverted", depth_inverted ? 1u : 0u);
   SetUInt(p, "DLSSNR.Reset", reset != 0 ? 1u : 0u);
 
   SetUInt(p, "DLSSNR.ColorSubrectBaseX", 0u);
   SetUInt(p, "DLSSNR.ColorSubrectBaseY", 0u);
-  SetUInt(p, "DLSSNR.ColorSubrectWidth", s.out_w);
-  SetUInt(p, "DLSSNR.ColorSubrectHeight", s.out_h);
+  SetUInt(p, "DLSSNR.ColorSubrectWidth", s.work_w);
+  SetUInt(p, "DLSSNR.ColorSubrectHeight", s.work_h);
   SetUInt(p, "DLSSNR.OutputSubrectBaseX", 0u);
   SetUInt(p, "DLSSNR.OutputSubrectBaseY", 0u);
-  SetUInt(p, "DLSSNR.OutputSubrectWidth", s.out_w);
-  SetUInt(p, "DLSSNR.OutputSubrectHeight", s.out_h);
+  SetUInt(p, "DLSSNR.OutputSubrectWidth", s.work_w);
+  SetUInt(p, "DLSSNR.OutputSubrectHeight", s.work_h);
   SetUInt(p, "DLSSNR.DepthSubrectBaseX", 0u);
   SetUInt(p, "DLSSNR.DepthSubrectBaseY", 0u);
   SetUInt(p, "DLSSNR.DepthSubrectWidth", s.render_w);
@@ -644,8 +660,8 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   // Anchor the model's answer to the original and write the blend into the game's output, which
   // its post-processing reads next.
   nr_compose::RecordPost(cmd, color, s.color_copy, s.proxy, s.output, s.out_w, s.out_h,
-                         s.eval_count, s.transfer, s.max_ratio, s.colour_strength, wp,
-                         (uint32_t)s.debug_view);
+                         s.work_w, s.work_h, s.eval_count, s.transfer, s.max_ratio,
+                         s.colour_strength, wp, (uint32_t)s.debug_view);
 }
 
 // Called after every successful game DLSS-SR evaluate, on the game's own command list.

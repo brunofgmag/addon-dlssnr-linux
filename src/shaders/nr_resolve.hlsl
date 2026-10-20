@@ -39,25 +39,5 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    const float lo = Luma(o);
-    const float lm = Luma(m);
-
-    if (lm > 1e-8 && lo > 1e-8)
-    {
-        const float ratio = clamp(lm / lo, 1.0 / g_max_ratio, g_max_ratio);
-        m *= (ratio * lo) / lm;  // luminance clamped to the guard, hue kept
-
-        // Whether the model's colour arrives with its light.
-        const float3 brightness_on_game_hue = o * (Luma(m) / lo);
-        m = lerp(brightness_on_game_hue, m, g_colour);
-    }
-    else
-    {
-        m = o;  // true black stays true black; the model invents nothing there
-    }
-
-    // NaN guard: any non-finite lane falls back to the original.
-    m = select(m == m, m, o);
-
-    Out[id.xy] = lerp(o, m, g_transfer);
+    Out[id.xy] = Anchor(o, m);
 }

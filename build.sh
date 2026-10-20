@@ -50,7 +50,7 @@ DXC="$HOME/.local/dxc/bin/dxc"
 SHADER_SRC="$HERE/src/shaders"
 SHADER_OUT="$OUT/shaders"
 mkdir -p "$SHADER_OUT"
-for sh in nr_encode nr_resolve nr_lum1 nr_lum2; do
+for sh in nr_encode nr_encode_down nr_resolve nr_resolve_scaled nr_lum1 nr_lum2; do
   hlsl="$SHADER_SRC/$sh.hlsl"
   hdr="$SHADER_OUT/${sh}_dxil.h"
   if [[ ! -f "$hdr" || "$hlsl" -nt "$hdr" || "$SHADER_SRC/nr_common.hlsli" -nt "$hdr" ]]; then

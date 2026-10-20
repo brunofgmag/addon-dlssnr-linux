@@ -25,20 +25,24 @@
 #pragma comment(lib, "d3d12")
 
 #include "../build/shaders/nr_encode_dxil.h"
+#include "../build/shaders/nr_encode_down_dxil.h"
 #include "../build/shaders/nr_resolve_dxil.h"
+#include "../build/shaders/nr_resolve_scaled_dxil.h"
 #include "../build/shaders/nr_lum1_dxil.h"
 #include "../build/shaders/nr_lum2_dxil.h"
 
 namespace nr_compose {
 
 constexpr uint32_t kRingSize = 8;        // frames of descriptor tables in flight
-constexpr uint32_t kSlotsPerFrame = 12;  // see the slot map in RecordPre/RecordPost
+constexpr uint32_t kSlotsPerFrame = 13;  // see the slot map in RecordPre/RecordPost
 constexpr uint32_t kReadbackRing = 4;    // frames the measurement is allowed to lag
 
 struct Compose {
   ID3D12RootSignature* root_sig = nullptr;
   ID3D12PipelineState* encode_pso = nullptr;
+  ID3D12PipelineState* encode_down_pso = nullptr;
   ID3D12PipelineState* resolve_pso = nullptr;
+  ID3D12PipelineState* resolve_scaled_pso = nullptr;
   ID3D12PipelineState* lum1_pso = nullptr;
   ID3D12PipelineState* lum2_pso = nullptr;
   ID3D12DescriptorHeap* heap = nullptr;
@@ -64,7 +68,9 @@ inline void Release() {
   if (c.lum2_pso != nullptr) c.lum2_pso->Release();
   if (c.lum1_pso != nullptr) c.lum1_pso->Release();
   if (c.encode_pso != nullptr) c.encode_pso->Release();
+  if (c.encode_down_pso != nullptr) c.encode_down_pso->Release();
   if (c.resolve_pso != nullptr) c.resolve_pso->Release();
+  if (c.resolve_scaled_pso != nullptr) c.resolve_scaled_pso->Release();
   if (c.root_sig != nullptr) c.root_sig->Release();
   c = {};
 }
@@ -78,14 +84,14 @@ inline bool MakePso(ID3D12Device* device, const unsigned char* dxil, size_t size
   return SUCCEEDED(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(out)));
 }
 
-// Root signature: [0] SRV table t0-t1, [1] UAV table u0, [2] seven root constants b0.
+// Root signature: [0] SRV table t0-t2, [1] UAV table u0, [2] seven root constants b0.
 inline bool Init(ID3D12Device* device) {
   if (c.root_sig != nullptr) return true;
   if (c.failed) return false;
 
   D3D12_DESCRIPTOR_RANGE srv_range = {};
   srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  srv_range.NumDescriptors = 2;
+  srv_range.NumDescriptors = 3;
   srv_range.BaseShaderRegister = 0;
   D3D12_DESCRIPTOR_RANGE uav_range = {};
   uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -126,7 +132,10 @@ inline bool Init(ID3D12Device* device) {
   }
 
   if (!MakePso(device, nr_encode_dxil, sizeof(nr_encode_dxil), &c.encode_pso) ||
+      !MakePso(device, nr_encode_down_dxil, sizeof(nr_encode_down_dxil), &c.encode_down_pso) ||
       !MakePso(device, nr_resolve_dxil, sizeof(nr_resolve_dxil), &c.resolve_pso) ||
+      !MakePso(device, nr_resolve_scaled_dxil, sizeof(nr_resolve_scaled_dxil),
+               &c.resolve_scaled_pso) ||
       !MakePso(device, nr_lum1_dxil, sizeof(nr_lum1_dxil), &c.lum1_pso) ||
       !MakePso(device, nr_lum2_dxil, sizeof(nr_lum2_dxil), &c.lum2_pso)) {
     c.failed = true;
@@ -278,13 +287,13 @@ inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, u
 // --- the two halves around the model -------------------------------------
 //
 // Descriptor slot map per ring frame:
-//   0-1  SRV colorCopy x2      (encode t0-t1, lum1 t0-t1)
-//   2    UAV proxy             (encode)
-//   3    UAV tile_buf          (lum1)
-//   4-5  SRV colorCopy, model  (resolve t0-t1)
-//   6    UAV game output       (resolve)
-//   7-8  SRV tile_buf x2       (lum2 t0-t1)
-//   9    UAV result_buf        (lum2)
+//   0-2   SRV colorCopy x3              (encode t0-t2, lum1 t0-t2)
+//   3     UAV proxy                     (encode)
+//   4     UAV tile_buf                  (lum1)
+//   5-7   SRV colorCopy, model, proxy   (resolve t0-t2)
+//   8     UAV game output               (resolve)
+//   9-11  SRV tile_buf x3               (lum2 t0-t2)
+//   12    UAV result_buf                (lum2)
 //
 // Persistent states between frames: colorCopy, proxy, modelOut, tile_buf, result_buf all
 // UNORDERED_ACCESS; the game's output is in UNORDERED_ACCESS around DLSS evaluation.
@@ -293,7 +302,7 @@ inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, u
 // game_out COPY_SOURCE, colorCopy and proxy NON_PIXEL_SHADER_RESOURCE (ready for the model).
 inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
                       ID3D12Resource* color_copy, ID3D12Resource* proxy, uint32_t w, uint32_t h,
-                      uint32_t frame, float white_point) {
+                      uint32_t work_w, uint32_t work_h, uint32_t frame, float white_point) {
   ID3D12Device* device = nullptr;
   if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return false;
   if (!Init(device) || !EnsureBuffers(device, w, h)) {
@@ -304,13 +313,17 @@ inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
   const uint32_t base = (frame % kRingSize) * kSlotsPerFrame;
   WriteSrv(device, base + 0, color_copy);
   WriteSrv(device, base + 1, color_copy);
-  WriteUav(device, base + 2, proxy);
-  WriteBufferUav(device, base + 3, c.tile_buf, c.tile_count, 8);
-  WriteBufferSrv(device, base + 7, c.tile_buf, c.tile_count, 8);
-  WriteBufferSrv(device, base + 8, c.tile_buf, c.tile_count, 8);
-  WriteBufferUav(device, base + 9, c.result_buf, 1, 4);
+  WriteSrv(device, base + 2, color_copy);
+  WriteUav(device, base + 3, proxy);
+  WriteBufferUav(device, base + 4, c.tile_buf, c.tile_count, 8);
+  WriteBufferSrv(device, base + 9, c.tile_buf, c.tile_count, 8);
+  WriteBufferSrv(device, base + 10, c.tile_buf, c.tile_count, 8);
+  WriteBufferSrv(device, base + 11, c.tile_buf, c.tile_count, 8);
+  WriteBufferUav(device, base + 12, c.result_buf, 1, 4);
 
   Params p = {0.0f, 0.0f, 0.0f, white_point, 0, w, h};
+  const Params work = {0.0f, 0.0f, 0.0f, white_point, 0, work_w, work_h};
+  const bool scaled = work_w != w || work_h != h;
 
   Barrier(cmd, game_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   Barrier(cmd, color_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -319,13 +332,18 @@ inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
   // The proxy the model will see.
-  Dispatch(cmd, c.encode_pso, base + 0, base + 2, p, (w + 7) / 8, (h + 7) / 8);
+  if (scaled) {
+    Dispatch(cmd, c.encode_down_pso, base + 0, base + 3, work, (work_w + 7) / 8,
+             (work_h + 7) / 8);
+  } else {
+    Dispatch(cmd, c.encode_pso, base + 0, base + 3, p, (w + 7) / 8, (h + 7) / 8);
+  }
 
   // The measurement for future frames' white point.
-  Dispatch(cmd, c.lum1_pso, base + 0, base + 3, p, (w + 15) / 16, (h + 15) / 16);
+  Dispatch(cmd, c.lum1_pso, base + 0, base + 4, p, (w + 15) / 16, (h + 15) / 16);
   Barrier(cmd, c.tile_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  Dispatch(cmd, c.lum2_pso, base + 7, base + 9, p, 1, 1);
+  Dispatch(cmd, c.lum2_pso, base + 9, base + 12, p, 1, 1);
   Barrier(cmd, c.result_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
           D3D12_RESOURCE_STATE_COPY_SOURCE);
   cmd->CopyBufferRegion(c.readback[frame % kReadbackRing], 0, c.result_buf, 0, 4);
@@ -343,23 +361,28 @@ inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
 // Resolve the model's answer over the game's output and restore every state for the next frame.
 inline void RecordPost(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
                        ID3D12Resource* color_copy, ID3D12Resource* proxy,
-                       ID3D12Resource* model_out, uint32_t w, uint32_t h, uint32_t frame,
-                       float transfer, float max_ratio, float colour, float white_point,
-                       uint32_t debug) {
+                       ID3D12Resource* model_out, uint32_t w, uint32_t h, uint32_t work_w,
+                       uint32_t work_h, uint32_t frame, float transfer, float max_ratio,
+                       float colour, float white_point, uint32_t debug) {
   ID3D12Device* device = nullptr;
   if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return;
 
   const uint32_t base = (frame % kRingSize) * kSlotsPerFrame;
-  WriteSrv(device, base + 4, color_copy);
-  WriteSrv(device, base + 5, model_out);
-  WriteUav(device, base + 6, game_out);
+  WriteSrv(device, base + 5, color_copy);
+  WriteSrv(device, base + 6, model_out);
+  WriteSrv(device, base + 7, proxy);
+  WriteUav(device, base + 8, game_out);
 
   Barrier(cmd, model_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Barrier(cmd, game_out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   Params p = {transfer, max_ratio, colour, white_point, debug, w, h};
-  Dispatch(cmd, c.resolve_pso, base + 4, base + 6, p, (w + 7) / 8, (h + 7) / 8);
+  if (work_w != w || work_h != h) {
+    Dispatch(cmd, c.resolve_scaled_pso, base + 5, base + 8, p, (w + 15) / 16, (h + 15) / 16);
+  } else {
+    Dispatch(cmd, c.resolve_pso, base + 5, base + 8, p, (w + 7) / 8, (h + 7) / 8);
+  }
 
   Barrier(cmd, model_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
